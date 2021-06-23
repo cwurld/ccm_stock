@@ -321,9 +321,9 @@ def skunk():
     }
 
     func_names = [
-        'calc_performance_by_threshold',
+        # 'calc_performance_by_threshold',
         # 'calc_performance_by_threshold_for_predictors',
-        # 'run_all_predictors',
+        'run_all_predictors',
         # 'make_summaries',
         # 'plot_run_all',
         # 'compare_train_test'
@@ -352,7 +352,8 @@ def skunk():
         target_stock = 'NPTN'
         predictor_stocks = ['PHD']  # ['NPTN', 'MTL', 'AGR', 'PHD', 'ESS', 'CBOE', 'AGRO', 'FPF', 'CHMA', 'SEAS']
         df_by_predictor = calc_performance_by_threshold_for_predictors(target_stock, predictor_stocks, config)
-        plot_calc_performance_scores_by_threshold_for_predictors(target_stock, df_by_predictor, config['predictor_field'])
+        plot_calc_performance_scores_by_threshold_for_predictors(
+            target_stock, df_by_predictor, config['predictor_field'])
         plt.show()
         return df_by_predictor
 
