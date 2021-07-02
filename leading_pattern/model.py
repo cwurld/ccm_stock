@@ -11,7 +11,7 @@ import pandas_datareader.data as web
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-from plotting import plot_spikes, plot_predictor_functions
+from leading_pattern.plotting import plot_spikes, plot_predictor_functions
 
 
 DATA_DIR = Path(__file__).parent.parent / 'data'
