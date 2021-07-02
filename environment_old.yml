@@ -1,0 +1,17 @@
+name: ccm_stock
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - numpy
+  - pandas
+  - pandas-datareader
+  - matplotlib
+  - scipy
+  - scikit-learn
+  - jupyter
+  - jupyterlab
+  - ipympl
+  - nodejs
+prefix: /Users/chuckmartin/.conda/envs/ccm_stock
+
