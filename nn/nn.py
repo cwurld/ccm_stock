@@ -1,5 +1,6 @@
 # Based on: https://www.tensorflow.org/tutorials/structured_data/time_series
 from abc import ABC
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -7,9 +8,16 @@ import matplotlib.pyplot as plt
 
 import tensorflow as tf
 
-import leading_pattern.model as utils
+import my_utils.loaders as loaders
+from my_utils.volatility import load_volatility
 
+
+RESULTS_DIR = Path(__file__).parent / 'results'
 MAX_EPOCHS = 200
+
+
+def get_results_dir(config):
+    return RESULTS_DIR / '{}_{}'.format(config['start_date'], config['end_date'])
 
 
 class NormalizeAndSplit:
@@ -89,15 +97,19 @@ class WindowGenerator:
     Based on: https://www.tensorflow.org/tutorials/structured_data/time_series
     """
 
-    def __init__(self, input_width, label_width, shift, train_df, val_df, test_df, label_columns):
+    def __init__(self, input_width, label_width, shift, train_df, val_df, test_df, label_columns=None,
+                 batch_size=32, shuffle=True, labels=None):
         # Store the raw data.
         self.train_df = train_df
         self.val_df = val_df
         self.test_df = test_df
+        self.batch_size = batch_size
+        self.shuffle = shuffle
 
         # Work out the label column indices.
-        self.label_columns = label_columns
-        self.label_columns_indices = {name: i for i, name in enumerate(label_columns)}
+        self.labels = labels
+        self.label_columns = label_columns or []
+        self.label_columns_indices = {name: i for i, name in enumerate(self.label_columns)}
         self.column_indices = {name: i for i, name in enumerate(train_df.columns)}
 
         # Work out the window parameters.
@@ -127,9 +139,9 @@ class WindowGenerator:
         labels = features[:, self.labels_slice, :]  # shift is implemented in labels_slice
 
         # Select the labels from all features
-        if self.label_columns is not None:
+        if self.label_columns:
             labels = tf.stack(
-                [labels[:, :, self.column_indices[name]] for name in self.label_columns],
+                [labels[:, :, self.label_columns_indices[name]] for name in self.label_columns],
                 axis=-1)
 
         # Slicing doesn't preserve static shape information, so set the shapes
@@ -138,11 +150,14 @@ class WindowGenerator:
         # Passing a None in the new shape allows any value for that axis:
         inputs.set_shape([None, self.input_width, None])
         labels.set_shape([None, self.label_width, None])
-
         return inputs, labels
 
-    def make_dataset(self, data, shuffle=True, batch_size=32):
+    def make_dataset(self, dataset_name):
+        data = getattr(self, dataset_name + '_df')
         data = np.array(data, dtype=np.float32)  # convert data frame into numpy 2D array (time, feature)
+
+        if self.labels is not None:
+            data += self.labels[dataset_name].reshape(data.shape[0], 1)
 
         # Create a dataset of sliding windows over a time series provided as array.
         # batch_size: Number of time series samples in each batch
@@ -154,8 +169,8 @@ class WindowGenerator:
             targets=None,
             sequence_length=self.total_window_size,
             sequence_stride=1,
-            shuffle=shuffle,
-            batch_size=batch_size)
+            shuffle=self.shuffle,
+            batch_size=self.batch_size)
 
         # ds is an iterator of batches. Split divides each batch into "inputs" and "labels"
         ds = ds.map(self.split_window)
@@ -163,15 +178,15 @@ class WindowGenerator:
 
     @property
     def train(self):
-        return self.make_dataset(self.train_df)
+        return self.make_dataset('train')
 
     @property
     def val(self):
-        return self.make_dataset(self.val_df)
+        return self.make_dataset('val')
 
     @property
     def test(self):
-        return self.make_dataset(self.test_df)
+        return self.make_dataset('test')
 
     @property
     def example(self):
@@ -273,12 +288,8 @@ class Baseline(tf.keras.Model, ABC):
 
 
 def compile_and_fit(model, window, patience=2, max_epochs=MAX_EPOCHS, verbose=1):
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                                      patience=patience,
-                                                      mode='min')
-
-    model.compile(loss=tf.losses.MeanSquaredError(),
-                  optimizer=tf.optimizers.Adam(),
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, mode='min')
+    model.compile(loss=tf.losses.MeanSquaredError(), optimizer=tf.optimizers.Adam(),
                   metrics=[tf.metrics.MeanAbsoluteError()])
 
     # Train on all the batches
@@ -289,15 +300,18 @@ def compile_and_fit(model, window, patience=2, max_epochs=MAX_EPOCHS, verbose=1)
 
 
 def load_data(target, predictors, config):
-    target_df = utils.get_data_set(target, config)
-
+    data = {}
     if predictors:
-        predictor_dfs = utils.get_data_sets(predictors, config)
+        predictor_dfs = loaders.get_data_sets(predictors, config)
         data = {symbol: values[config['predictor_field']] for symbol, values in predictor_dfs.items()}
+
+    if target in predictors:
+        data['target'] = data.pop(target)
     else:
-        data = {}
-    data['target'] = target_df[config['price_field']]
-    df = pd.DataFrame(data)
+        target_df = loaders.get_data_set(target, config)
+        data['target'] = target_df[config['price_field']]
+
+    df = pd.DataFrame(data).fillna(0.0)
     return df
 
 
@@ -310,7 +324,7 @@ def make_test_data(model_type, config):
         #   predictor[t-1] = (target[t] - w1*target[t-1]) / w2
         #   predictor[t] = (target[t + 1] - w1*target[t]) / w2
         #   predictor[t] = target[t + 1]/w2 -(w1/w2) * target[t]
-        target = utils.get_data_set('NPTN', config)  # this stock has interesting variation
+        target = loaders.get_data_set('NPTN', config)  # this stock has interesting variation
         w1 = 0.5
         w2 = 0.2
 
@@ -328,7 +342,7 @@ def make_test_data(model_type, config):
         #                   w5*predictor[t-1] - w6*predictor[t-2]
         # predictor[t] = (target[t+1] - w1*target[t] -   w2*target[t-1] - w3*target[t-2] -
         #                w5*predictor[t-1] - w6*predictor[t-2]) / w4
-        target = utils.get_data_set('NPTN', config)  # this stock has interesting variation
+        target = loaders.get_data_set('NPTN', config)  # this stock has interesting variation
         w = np.array([0.2, 0.2, 0.2, 0.1, 0.1, 0.1])
         n = len(target[pf])
         p = np.zeros(n)
@@ -349,7 +363,7 @@ def make_test_data(model_type, config):
         weights = [np.array([[0.2, 0.1, 0.2, 0.1, 0.2, 0.1]]).transpose(), np.array([0.0])]
     elif model_type == 'multistep':
         # In this approach, we will synthesize the target from the predictor. Hopefully that will be more stable.
-        predictor = utils.get_data_set('NPTN', config)  # this stock has interesting variation
+        predictor = loaders.get_data_set('NPTN', config)  # this stock has interesting variation
         p = predictor[pf]  # make the target we loaded into the predictor
 
         w = np.array([0.4, 0.3, 0.2, 0.3, -0.1, 2.0])
@@ -384,23 +398,28 @@ def skunk():
         'predictor_field': 'Open'
     }
     splits = [0.5, 0.75]
+    results_dir = get_results_dir(config)
 
     data_gen = 'real'
     plot_stocks = 0
     run_baseline = 1
     plot_baseline = 0
-    run_linear_single_step = 1
+    run_linear_single_step = 0
     apply_weights = 0
     run_linear_multi_step = 0
     run_multi_step_dense = 0
-    run_conv_model = 0
+    run_conv_model = 1
     # noinspection PyPep8Naming
     run_LSTM_model = 0
 
     if data_gen == 'real':
-        target = 'NPTN'
-        predictors = ['MTL', 'AGR', 'PHD', 'ESS', 'CBOE', 'AGRO', 'FPF', 'CHMA', 'SEAS']
-        n_predictors = len(predictors) + 1
+        target = 'MTL'
+        # predictors = ['MTL', 'AGR', 'PHD', 'ESS', 'CBOE', 'AGRO', 'FPF', 'CHMA', 'SEAS']
+        volatility = load_volatility(results_dir, config)
+        predictors = [x[0] for x in volatility[0:5]]
+        n_predictors = len(predictors)
+        print(predictors)
+        print('n predictors: {}'.format(n_predictors))
         df = load_data(target, predictors, config)
         norm_and_split = NormalizeAndSplit(df, splits, 'target')
         train_df, val_df, test_df = norm_and_split.moving_avg(10)
@@ -558,12 +577,15 @@ def skunk():
             multi_step_dense.evaluate(conv_window.test, verbose=0)[1]
         ]
         mean_absolute_error.append(perf)
-        conv_window.plot_fit(multi_step_dense, None, 'Multistep Dense')
+        conv_window.plot_fit(multi_step_dense, norm_and_split.de_normalize, 'Multistep Dense')
         plt.show()
+
+        print('Multistep dense')
 
     # Convolution model
     if run_conv_model:
-        n_filters = n_predictors * 2
+        # n_filters = n_predictors * 2
+        n_filters = 5
         conv_model = tf.keras.Sequential([
             tf.keras.layers.Conv1D(filters=n_filters, kernel_size=(CONV_WIDTH,), activation='relu'),
             tf.keras.layers.Dense(units=n_filters, activation='relu'),
@@ -581,6 +603,8 @@ def skunk():
         
         conv_window.plot_fit(conv_model, norm_and_split.de_normalize, 'Conv')
         plt.show()
+
+        print('Convolution Model')
 
     # LSTM model
     if run_LSTM_model:
