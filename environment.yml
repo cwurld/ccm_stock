@@ -15,4 +15,5 @@ dependencies:
   - nodejs
   - pip:
     - tensorflow
+    - tf-nightly
 prefix: /Users/chuckmartin/.conda/envs/ccm_stock

@@ -1,10 +1,13 @@
 from unittest import TestCase
+import random
 
 import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from nn import NormalizeAndSplit
+from nn2 import make_labels_for_threshold, make_labels
+from window_generators import IntermixedWindowGenerator
 
 
 class TestNormalizeAndSplit(TestCase):
@@ -82,3 +85,112 @@ class TestNormalizeAndSplit(TestCase):
         np.testing.assert_allclose(p2, self.df['d1'][5:7].to_numpy(), rtol=0.01)
 
         # print('x')
+
+
+def calc_n_pos(data):
+    np = len([v for v in data if v > 0.5])
+    nn = len(data) - np
+    return np, nn
+
+
+class TestIntermixedWindowGenerator(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.n = 100
+
+        data = {
+            'p1': np.arange(self.n, dtype=int),
+            'p2': np.full((self.n,), 1, dtype=int),
+            'p3': np.full((self.n,), 2, dtype=int)
+        }
+        self.df = pd.DataFrame(data)
+        self.labels = np.arange(self.n, dtype=int)
+        self.splits = [0.55, 0.82]
+        self.window_width = 3
+        self.min_run_length = 9
+
+    def test_1(self):
+        wg = IntermixedWindowGenerator(self.df, self.labels, self.splits, self.window_width, self.min_run_length)
+
+        # Make sure the times in each set are unique and there are no lost time points
+        times = {'train': set(), 'validation': set(), 'test': set()}
+        all_times = set()
+        for set_name in ['train', 'validation', 'test']:
+            for sample, output_sample in zip(wg.inputs[set_name], wg.outputs[set_name]):
+                times[set_name].update(sample[:, 0])  # all rows first column
+                all_times.update(sample[:, 0], sample[:, 0])
+                # Make sure the outputs align with the inputs
+                self.assertEqual(sample[-1, 0], output_sample)  #
+
+        self.assertFalse(times['train'].intersection(times['validation']))
+        self.assertFalse(times['train'].intersection(times['test']))
+        self.assertFalse(times['test'].intersection(times['validation']))
+        self.assertEqual(set(list(range(99))), all_times)
+
+        # print('x')
+
+    def test_balanced(self):
+        labels = np.zeros(self.n)
+
+        # Make 30 positive
+        random.seed(1)
+        ii = random.sample(range(0, self.n), 30)
+        labels[ii] = 1.0
+
+        wg = IntermixedWindowGenerator(self.df, labels, self.splits, self.window_width, self.min_run_length,
+                                       balanced=True)
+
+        for set_name in ['train', 'validation']:
+            n_pos1, n_neg1 = calc_n_pos(wg.balanced_outputs[set_name])
+            n_pos2, n_neg2 = calc_n_pos(wg.outputs[set_name])
+            self.assertEqual(n_pos1, n_pos2)
+            self.assertTrue(abs(n_pos1 - n_neg1) < 2)
+
+        # print('x')
+
+
+class TestMakeLabels(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.threshold = 0.02
+        self.conv_width = 3
+        t = self.threshold + 0.01
+
+        n = 50
+        frac_diff = np.zeros(n)
+        self.expected_labels = np.zeros(n)
+
+        # Test edge effects by putting a block above threshold starting at 0.
+        frac_diff[0:4] = t
+        self.expected_labels[0] = 1.0
+
+        # This increase occurs too close to prev, so it is ignored
+        frac_diff[5] = t
+
+        # Put in a double, only first one will be a label
+        frac_diff[10:12] = t
+        self.expected_labels[10] = 1.0
+
+        # Put in a single
+        frac_diff[20] = t
+        self.expected_labels[20] = 1.0
+
+        # Convert frac diff into prices
+        self.prices = np.empty(n + 1)
+        self.prices[0] = 100.0
+        for i, fd in enumerate(frac_diff):
+            self.prices[i + 1] = (1.0 + fd) * self.prices[i]
+
+        self.prices = pd.DataFrame({'Open': self.prices})
+
+    def test_1(self):
+        labels = make_labels_for_threshold(self.prices['Open'], self.threshold, self.conv_width)
+        np.testing.assert_almost_equal(self.expected_labels, labels)
+        print('x')
+
+    def test_2(self):
+        labels, threshold, fp = make_labels(self.prices['Open'], self.conv_width, frac_positive=0.05)
+
+        self.assertIsNotNone(labels)
+        self.assertAlmostEqual(0.03, threshold)
+        print('x')

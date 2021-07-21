@@ -1,23 +1,14 @@
-from pathlib import Path
-from functools import partial
-
 # Binary Classification
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.wrappers.scikit_learn import KerasClassifier
-from sklearn.model_selection import cross_val_score
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
+import matplotlib.pyplot as plt
 
-from nn import load_data, WindowGenerator, NormalizeAndSplit
+import nn
 from my_utils.volatility import load_volatility
+from window_generators import IntermixedWindowGenerator
 
 RESULTS_DIR = Path(__file__).parent / 'results'
 
@@ -26,20 +17,132 @@ def get_results_dir(config):
     return RESULTS_DIR / '{}_{}'.format(config['start_date'], config['end_date'])
 
 
-def multistep_dense(n_predictors, conv_width):
-    n_units = n_predictors * conv_width
+def diff_norm(df):
+    norm_df = df.copy()
+    norm_df = (norm_df.diff(1) / norm_df).iloc[1:, :]
+    norm_df.replace([np.inf, -np.inf], 0.0, inplace=True)
+    return norm_df
+
+
+def make_labels(prices, conv_width, frac_positive=0.2):
+    """Loop through thresholds to find one that produces the specified frac positive."""
+    threshold = 0.05
+    fp = 0.0
+    while threshold > 0.0:
+        labels = make_labels_for_threshold(prices, threshold, conv_width)
+        ii = np.where(labels > 0.5)
+        fp = ii[0].shape[0] / prices.shape[0]
+        if fp > frac_positive:
+            return labels, threshold, fp
+        threshold -= 0.005
+
+    return None, threshold, fp
+
+
+def make_labels_for_threshold(prices, threshold, conv_width):
+    """
+    Our hypothesis is that an event triggers a price spike and we are trying to detect the start of that spike.
+
+    Our model is not designed to handle multi-day increases. So simply labelling that data by price changes that
+    are above threshold is not correct.
+
+    This function only labels the first price change that is above threshold in a series. It also only
+    accepts first price changes that are preceded by conv_window price that are below the threshold.
+    """
+    frac_diff = ((-prices.diff(-1).to_numpy()) / prices)[0: -1]
+    labels = np.zeros(frac_diff.shape[0])
+    black_out = -1
+    for i, x in enumerate(frac_diff):
+        if x >= threshold:
+            if i > black_out:
+                # If there are multiple successive prices above threshold, take the first one
+                if i == 0 or frac_diff[i - 1] < threshold:
+                    labels[i] = 1.0
+            black_out = i + conv_width
+    return labels
+
+
+def add_signals(df, labels, kernels):
+    """
+    For testing models.
+
+    Adds signals to predictors before each positive label. This should make the models have an accuracy near 100%.
+    """
+    for i, label in enumerate(labels):
+        if label > 0.5:
+            for col, k in kernels.items():
+                start = i - len(k) + 1
+                if start >= 0:
+                    df[col][start: i + 1] = k
+
+
+def calc_output_bias(p_div_n):
+    """
+    Initial model bias for unbalanced data.
+
+    :param p_div_n: positive rate divided by negative rate
+    :type p_div_n: float
+    :return:
+    :rtype: float
+    """
+    if p_div_n is not None:
+        bias = np.log([p_div_n])
+        output_bias = tf.keras.initializers.Constant(bias)
+    else:
+        output_bias = None
+    return output_bias
+
+
+def conv_model(n_filters, conv_width, n_predictors, p_div_n=None):
+    output_bias = calc_output_bias(p_div_n)
     model = tf.keras.Sequential([
-        # Shape: (time, features) => (time*features)
-        tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(units=n_units, activation='relu'),
-        tf.keras.layers.Dense(units=n_units, activation='relu'),
-        tf.keras.layers.Dense(1, activation='sigmoid'),
-        # Add back the time dimension.
-        # Shape: (outputs) => (1, outputs)
-        tf.keras.layers.Reshape([1, -1]),
+        tf.keras.layers.Conv1D(filters=n_filters, kernel_size=(conv_width,), activation='relu',
+                               input_shape=[conv_width, n_predictors]),
+        tf.keras.layers.Dense(units=n_filters, activation='relu'),
+        tf.keras.layers.Dense(units=1, activation='sigmoid', bias_initializer=output_bias)
     ])
-    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
     return model
+
+
+def limited_filters_conv_model(n_filters, conv_width, n_predictors, p_div_n=None):
+    """
+    Want to limit the number of filters. Let:
+
+        p = number of predictors = 100
+        f = number of filters = 10
+        k = kernel size = 3
+
+    If we do Conv1D, each filter will have kxp weights and will produce one output. If we combine these outputs with a f
+    to one dense layer, then the total number of weights is:
+
+        k*p*f + f which is approximately p*(k*f)
+
+        3*100*10 + 10 = 3010 weights
+
+
+    If we stack the inputs into one vector, then the filter will have k elements. If we do a stride of k, then
+    each output
+    from Conv1D will come from one predictor. The number of outputs from all filters will be p*f. Combining these
+    with one dense layer gives:
+
+        k*f + f*p which is approximately p*f
+        3x10 + 10*100 = 1030
+
+    In other words, the first method has k times as many weights.
+    """
+    output_bias = calc_output_bias(p_div_n)
+    model = tf.keras.Sequential([
+        tf.keras.layers.Permute((2, 1)),
+        tf.keras.layers.Reshape([1, conv_width * n_predictors, 1]),
+        tf.keras.layers.Conv1D(filters=n_filters, kernel_size=(conv_width,), activation='relu', strides=(conv_width,)),
+        tf.keras.layers.Flatten(),
+        # tf.keras.layers.Dense(units=5, activation='relu'),
+        tf.keras.layers.Dense(units=1, activation='sigmoid', bias_initializer=output_bias)
+    ])
+    return model
+
+
+CONV_WIDTH = 3
 
 
 def f():
@@ -52,66 +155,55 @@ def f():
     splits = [0.5, 0.75]
     results_dir = get_results_dir(config)
 
-    target = 'MTL'
-    # predictors = ['MTL', 'AGR', 'PHD', 'ESS', 'CBOE', 'AGRO', 'FPF', 'CHMA', 'SEAS']
+    # Load data
     volatility = load_volatility(results_dir, config)
-    predictors = [x[0] for x in volatility[0:20]]
-    n_predictors = len(predictors)
-    print(predictors)
+    target = 'PLAG'
+    predictors = [x[0] for x in volatility[0:100]]
+    dataframe = nn.load_data(target, predictors, config)
+    n_predictors = dataframe.shape[1]
+    n_filters = max(min(10, int(n_predictors / 4)), 4)
+
+    # label data
+    labels, threshold, frac_pos = make_labels(dataframe.target, CONV_WIDTH, frac_positive=0.09)
+    print('Percent positive: {}'.format(100 * frac_pos))
+    if labels is None:
+        print('There are not enough price spikes in {}'.format(target))
+        return
+
+    # Normalize
+    norm_df = diff_norm(dataframe)
+
+    if 0:
+        # Adds signal before each positive label for testing the model
+        kernels = {
+            predictors[0]: [0.05, -0.05, 1.0]
+        }
+        # For testing the model.
+        add_signals(norm_df, labels, kernels)
+
+    conv_window = IntermixedWindowGenerator(norm_df, labels, splits, CONV_WIDTH, balanced=True)
+
+    # model = conv_model(n_filters, CONV_WIDTH, n_predictors)
+    model = limited_filters_conv_model(n_filters, CONV_WIDTH, n_predictors)
+    history = nn.compile_and_fit_classifier(model, conv_window, patience=10, max_epochs=200, verbose=1)
+    model.summary()
+
     print('n predictors: {}'.format(n_predictors))
-    dataframe = load_data(target, predictors, config)
+    print('n filters: {}'.format(n_filters))
+    print(predictors + [target])
 
-    # Make classes: 1 if next price is greater than price, 0 otherwise
-    diff = dataframe.target.diff(-1).to_numpy()
-    labels = np.zeros(diff.shape[0])
-    ii = np.where(diff < 0.0)
-    labels[ii] = 1.0
-    n = len(dataframe)
-    split_labels = {
-        'train': labels[0: int(n * splits[0])],
-        'val': labels[int(n * splits[0]): int(n * splits[1])],
-        'test': labels[int(n * splits[1]): None]
-    }
+    auc_train = model.evaluate(x=conv_window.train[0], y=conv_window.train[1], verbose=0)[7]
+    auc_val = model.evaluate(x=conv_window.val[0], y=conv_window.val[1], verbose=0)[7]
+    print('Train AUC: {}'.format(auc_train))
+    print('Val   AUC: {}'.format(auc_val))
 
-    norm_and_split = NormalizeAndSplit(dataframe, splits, None)
-    train_df, val_df, test_df = norm_and_split.no_norm()
+    plt.plot(history.history['loss'], label='train')
+    plt.plot(history.history['val_loss'], label='val')
+    plt.legend()
+    plt.title('Loss')
+    plt.show()
 
-    CONV_WIDTH = 3
-    input_width = CONV_WIDTH
-    label_width = 1
-    shift = 1
-    conv_window = WindowGenerator(input_width, label_width, shift, train_df, val_df, test_df, 
-                                  batch_size=1000, shuffle=False, labels=split_labels)
-
-    # dataset = dataframe.values
-    # # split into input (X) and output (Y) variables
-    # X = dataset[:, 0:60].astype(float)
-    # Y = dataset[:, 60]
-    # # encode class values as integers
-    # encoder = LabelEncoder()
-    # encoder.fit(Y)
-    # encoded_Y = encoder.transform(Y)
-
-    # baseline model
-    def create_baseline():
-        # create model
-        model = Sequential()
-        model.add(Dense(60, input_dim=60, activation='relu'))
-        model.add(Dense(1, activation='sigmoid'))
-        # Compile model
-        model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-        return model
-
-    x = conv_window.train
-    build_fn = partial(multistep_dense, n_predictors, CONV_WIDTH)
-    # evaluate baseline model with standardized dataset
-    estimators = []
-    # estimators.append(('standardize', StandardScaler()))
-    estimators.append(('mlp', KerasClassifier(build_fn=build_fn, epochs=100, batch_size=5, verbose=0)))
-    pipeline = Pipeline(estimators)
-    kfold = StratifiedKFold(n_splits=10, shuffle=True)
-    results = cross_val_score(pipeline, train_df.values, split_labels['train'], cv=kfold)
-    print("Standardized: %.2f%% (%.2f%%)" % (results.mean() * 100, results.std() * 100))
+    print('done')
 
 
 if __name__ == '__main__':

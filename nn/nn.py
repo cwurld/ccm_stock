@@ -1,3 +1,5 @@
+# Regression models
+
 # Based on: https://www.tensorflow.org/tutorials/structured_data/time_series
 from abc import ABC
 from pathlib import Path
@@ -21,10 +23,11 @@ def get_results_dir(config):
 
 
 class NormalizeAndSplit:
-    def __init__(self, df, splits, target):
+    def __init__(self, df, splits, target, no_norm_cols=()):
         self.df = df
         self.splits = splits
         self.target = target
+        self.no_norm_cols = no_norm_cols
         
         n = len(df)
         self.slices = {
@@ -52,8 +55,10 @@ class NormalizeAndSplit:
         self.train_mean = split_dfs['train'].mean()
         self.train_std = split_dfs['train'].std()
 
-        for df_name in split_dfs:
-            split_dfs[df_name] = (split_dfs[df_name] - self.train_mean) / self.train_std
+        for col in ndf.columns:
+            if col not in self.no_norm_cols:
+                for df_name in split_dfs:
+                    split_dfs[df_name][col] = (split_dfs[df_name][col] - self.train_mean[col]) / self.train_std[col]
 
         self.norm_method = 'norm_by_mean'
         return tuple(split_dfs.values())
@@ -66,8 +71,12 @@ class NormalizeAndSplit:
         self.window_width = window_width
         df = self.df.copy()
         self.moving_avg_dataframe = df.rolling(window_width).sum() / window_width
-        normalized = (df - self.moving_avg_dataframe) / self.moving_avg_dataframe
-        split_dfs = self.apply_splits(normalized)
+
+        for col in df.columns:
+            if col not in self.no_norm_cols:
+                df[col] = (df[col] - self.moving_avg_dataframe[col]) / self.moving_avg_dataframe[col]
+
+        split_dfs = self.apply_splits(df)
         split_dfs['train'] = split_dfs['train'][window_width-1:]
         self.norm_method = 'moving_average'
         return tuple(split_dfs.values())
@@ -98,7 +107,7 @@ class WindowGenerator:
     """
 
     def __init__(self, input_width, label_width, shift, train_df, val_df, test_df, label_columns=None,
-                 batch_size=32, shuffle=True, labels=None):
+                 batch_size=32, shuffle=True, exclude_labels=False):
         # Store the raw data.
         self.train_df = train_df
         self.val_df = val_df
@@ -107,9 +116,9 @@ class WindowGenerator:
         self.shuffle = shuffle
 
         # Work out the label column indices.
-        self.labels = labels
+        self.exclude_labels = exclude_labels
         self.label_columns = label_columns or []
-        self.label_columns_indices = {name: i for i, name in enumerate(self.label_columns)}
+        self.label_columns_indices = {name: i for i, name in enumerate(train_df.columns) if name in self.label_columns}
         self.column_indices = {name: i for i, name in enumerate(train_df.columns)}
 
         # Work out the window parameters.
@@ -135,7 +144,10 @@ class WindowGenerator:
 
     def split_window(self, features):
         # features = [sample index, time, feature], time is 0 to total_window_size - 1
-        inputs = features[:, self.input_slice, :]
+        if self.exclude_labels:
+            inputs = features[:, self.input_slice, 0: -1]
+        else:
+            inputs = features[:, self.input_slice, :]
         labels = features[:, self.labels_slice, :]  # shift is implemented in labels_slice
 
         # Select the labels from all features
@@ -156,9 +168,6 @@ class WindowGenerator:
         data = getattr(self, dataset_name + '_df')
         data = np.array(data, dtype=np.float32)  # convert data frame into numpy 2D array (time, feature)
 
-        if self.labels is not None:
-            data += self.labels[dataset_name].reshape(data.shape[0], 1)
-
         # Create a dataset of sliding windows over a time series provided as array.
         # batch_size: Number of time series samples in each batch
         # shuffle: Whether to shuffle output samples or instead draw them in chronological order.
@@ -173,6 +182,8 @@ class WindowGenerator:
             batch_size=self.batch_size)
 
         # ds is an iterator of batches. Split divides each batch into "inputs" and "labels"
+        for x in ds:
+            self.split_window(x)
         ds = ds.map(self.split_window)
         return ds
 
@@ -239,19 +250,30 @@ class WindowGenerator:
         y_min = 10000.0
         y_max = 0.0
         for data_set in ['train', 'val', 'test']:
-            the_data = self.make_dataset(getattr(self, data_set + '_df'), shuffle=False, batch_size=2000)
+            the_data = self.make_dataset(data_set)
             fit_data[data_set] = {}
+
+            # Unbatch
+            predictions = None
+            expected = None
             for inputs, labels in the_data:
-                if denorm:
-                    predictions = denorm(model(inputs).numpy().flatten(), data_set, self.total_window_size)
-                    expected = denorm(labels.numpy().flatten(), data_set, self.total_window_size)
-                else:
+                if predictions is None:
                     predictions = model(inputs).numpy().flatten()
                     expected = labels.numpy().flatten()
-                y_min = min([y_min, predictions.min(), expected.min()])
-                y_max = max([y_max, predictions.max(), expected.max()])
-                fit_data[data_set]['predictions'] = predictions
-                fit_data[data_set]['expected'] = expected
+                else:
+                    predictions = np.concatenate((predictions, model(inputs).numpy().flatten()))
+                    expected = np.concatenate((expected, labels.numpy().flatten()))
+
+            if denorm:
+                predictions = denorm(predictions, data_set, self.total_window_size)
+                expected = denorm(expected, data_set, self.total_window_size)
+
+            # noinspection PyArgumentList
+            y_min = min([y_min, predictions.min(), expected.min()])
+            # noinspection PyArgumentList
+            y_max = max([y_max, predictions.max(), expected.max()])
+            fit_data[data_set]['predictions'] = predictions
+            fit_data[data_set]['expected'] = expected
 
         fig = plt.figure(figsize=(8, 8))
         fig.tight_layout(pad=20.0)
@@ -299,6 +321,32 @@ def compile_and_fit(model, window, patience=2, max_epochs=MAX_EPOCHS, verbose=1)
     return history
 
 
+def compile_and_fit_classifier(model, window, patience=2, max_epochs=MAX_EPOCHS, verbose=1):
+    metrics = [
+        tf.keras.metrics.TruePositives(name='tp'),
+        tf.keras.metrics.FalsePositives(name='fp'),
+        tf.keras.metrics.TrueNegatives(name='tn'),
+        tf.keras.metrics.FalseNegatives(name='fn'),
+        tf.keras.metrics.Precision(name='precision'),
+        tf.keras.metrics.Recall(name='recall'),
+        tf.keras.metrics.AUC(name='auc'),
+        tf.keras.metrics.AUC(name='prc', curve='PR'),  # precision-recall curve
+    ]
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, mode='min')
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=metrics)
+
+    # Train on all the batches
+    if type(window.train) == tuple:
+        history = model.fit(x=window.train[0], y=window.train[1], epochs=max_epochs,
+                            validation_data=window.val,
+                            callbacks=[early_stopping], verbose=verbose)
+    else:
+        history = model.fit(window.train, epochs=max_epochs,
+                            validation_data=window.val,
+                            callbacks=[early_stopping], verbose=verbose)
+    return history
+
+
 def load_data(target, predictors, config):
     data = {}
     if predictors:
@@ -315,7 +363,7 @@ def load_data(target, predictors, config):
     return df
 
 
-def make_test_data(model_type, config):
+def make_test_data(model_type, config, extra_predictors=()):
     """Make data that matches models so we can see if the models are working as designed."""
     pf = config['predictor_field']
 
@@ -332,6 +380,7 @@ def make_test_data(model_type, config):
         predictor[pf] = (target[pf].shift(-1) / w2) - ((w1 / w2) * target[pf])
         df = pd.DataFrame({'target': target[pf], 'P1': predictor[pf]})
         weights = [np.array([[w1, w2]]).transpose(), np.array([0.0])]
+        starting_index = 0
     elif model_type == 'multistep_old':
         # The method below is not great because it can lead to wild oscillations in the predictor stock.
         # target[t]   = w1*target[t-1] + w2*target[t-2] + w3*target[t-3] + w4*predictor[t-1] +
@@ -359,11 +408,12 @@ def make_test_data(model_type, config):
 
         predictor = target.copy()
         predictor[pf] = p
-        df = pd.DataFrame({'target': target[pf][3:], 'P1': predictor[pf][3:]})
+        starting_index = 3
+        df = pd.DataFrame({'target': target[pf][starting_index:], 'P1': predictor[pf][starting_index:]})
         weights = [np.array([[0.2, 0.1, 0.2, 0.1, 0.2, 0.1]]).transpose(), np.array([0.0])]
     elif model_type == 'multistep':
         # In this approach, we will synthesize the target from the predictor. Hopefully that will be more stable.
-        predictor = loaders.get_data_set('NPTN', config)  # this stock has interesting variation
+        predictor = loaders.get_data_set('PLAG', config)  # this stock has interesting variation
         p = predictor[pf]  # make the target we loaded into the predictor
 
         w = np.array([0.4, 0.3, 0.2, 0.3, -0.1, 2.0])
@@ -379,13 +429,19 @@ def make_test_data(model_type, config):
             target[t] = w[0] * target[t - 1] + w[1] * target[t - 2] + w[2] * target[t - 3] + \
                         w[3] * p[t - 1] + w[4] * p[t - 2] + w[5] * p[t - 3]
 
-        if 0:
+        if 1:
             plt.plot(target[3:])
             plt.show()
-        df = pd.DataFrame({'target': target[3:], 'P1': predictor[pf][3:]})
+        starting_index = 3
+        df = pd.DataFrame({'P1': predictor[pf][starting_index:], 'target': target[starting_index:]})
         weights = [np.array([[w[2], w[5], w[1], w[4], w[0], w[3]]]).transpose(), np.array([0.0])]
     else:
         raise RuntimeError('Invalid model type')
+
+    for ep_symbol in extra_predictors:
+        ep = loaders.get_data_set(ep_symbol, config)
+        df[ep_symbol] = ep[pf][starting_index:]
+
     return df, weights
 
 
@@ -407,8 +463,8 @@ def skunk():
     run_linear_single_step = 0
     apply_weights = 0
     run_linear_multi_step = 0
-    run_multi_step_dense = 0
-    run_conv_model = 1
+    run_multi_step_dense = 1
+    run_conv_model = 0
     # noinspection PyPep8Naming
     run_LSTM_model = 0
 
@@ -568,7 +624,7 @@ def skunk():
             tf.keras.layers.Reshape([1, -1]),
         ])
 
-        compile_and_fit(multi_step_dense, conv_window, patience=10, max_epochs=500)
+        compile_and_fit(multi_step_dense, conv_window, patience=10, max_epochs=20)
 
         perf = [
             'Multi step dense',
