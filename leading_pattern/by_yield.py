@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import scipy.stats as stats
 
 import model
+import my_utils.loaders as loaders
 
 from plotting import (
     plot_calc_performance_scores_by_threshold,
@@ -64,7 +65,7 @@ def calc_performance_for_buys(buys, prices, config):
 
 
 def calc_performance_by_threshold(target_df, predictor_stock, config, min_threshold=0.1, data_set_name='test'):
-    predictor_df = model.get_data_set(predictor_stock, config)
+    predictor_df = loaders.get_data_set(predictor_stock, config)
     predictor_func = model.get_predictor_func(target_df['train'], predictor_df['train'], config)
 
     model.calc_r_squared(predictor_df[data_set_name], predictor_func, config)
@@ -140,7 +141,7 @@ def calc_performance_by_threshold(target_df, predictor_stock, config, min_thresh
 def calc_performance_by_threshold_for_predictors(
         target_stock, predictor_stocks, config, data_set_name='test', min_threshold=0.1):
     """Runs calc_performance_by_threshold() on a list of predictor stock symbols."""
-    target_df = model.get_data_set(target_stock, config)
+    target_df = loaders.get_data_set(target_stock, config)
     df_by_predictor = {}
     for predictor_stock in predictor_stocks:
         df_by_predictor[predictor_stock] = \
@@ -177,7 +178,7 @@ def compare_train_test(stock, config, n_rows=10):
 
 
 def plot_train_vs_test(target_stock, predictor_stock, config):
-    data_sets = model.get_data_sets([target_stock, predictor_stock], config)
+    data_sets = loaders.get_data_sets([target_stock, predictor_stock], config)
 
     model.find_spikes(data_sets['train'][target_stock], config)
     predictor_func = model.get_predictor_snippets(
@@ -196,7 +197,7 @@ def run_all_predictors(target_stock, config, data_set_name='test', dry_run=False
     filename_suffix = '_'.join([target_stock, config['predictor_field'], data_set_name])
     results_dir = model.get_results_dir(config)
 
-    target_df = model.get_data_set(target_stock, config)
+    target_df = loaders.get_data_set(target_stock, config)
     model.find_spikes(target_df['train'], config)
 
     if data_set_name == 'test':
@@ -231,7 +232,7 @@ def run_all_predictors(target_stock, config, data_set_name='test', dry_run=False
 
     count = 0
     start = time.time()
-    predictor_symbols = model.get_all_symbols_in_cache(config)
+    predictor_symbols = loaders.get_all_symbols_in_cache(config)
     for i, predictor_symbol in enumerate(predictor_symbols):
         if predictor_symbol not in performance_by_stock:
             df = calc_performance_by_threshold(target_df, predictor_symbol, config, min_threshold=0.5,
@@ -333,7 +334,7 @@ def skunk():
         # config['predictor_field'] = 'Volume'
         target_stock = 'NPTN'
         predictor_stock = 'NOMD'
-        target_df = model.get_data_set(target_stock, config)
+        target_df = loaders.get_data_set(target_stock, config)
 
         df = calc_performance_by_threshold(target_df, predictor_stock, config, data_set_name='test')
         plot_calc_performance_scores_by_threshold(df, target_stock, predictor_stock)
@@ -372,7 +373,7 @@ def skunk():
         # noinspection SpellCheckingInspection
         symbols = ['MTL']  # ['OTIC', 'CFRX', 'TANH', 'CCM', 'LUNA', 'RBCAA', 'ARLO', 'DSWL', 'SLAB', 'OHI']
         for symbol in symbols:
-            df = model.get_data_set(symbol, config)
+            df = loaders.get_data_set(symbol, config)
             calc_summary_stats(df, config, data_set_name='train')
 
     if 'plot_run_all' in func_names:
