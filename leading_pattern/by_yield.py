@@ -10,10 +10,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-import model
+import leading_pattern.model as model
 import my_utils.loaders as loaders
 
-from plotting import (
+from leading_pattern.plotting import (
     plot_calc_performance_scores_by_threshold,
     plot_calc_performance_scores_by_threshold_for_predictors
 )

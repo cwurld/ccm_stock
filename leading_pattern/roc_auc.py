@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import model
+import leading_pattern.model as model
 from utils import big_results_writer
-import plotting
+import leading_pattern.plotting as plotting
 
 
 def calc_fpr_tpr(target_df, predictor_df, config):

@@ -14,7 +14,5 @@ dependencies:
   - jupyterlab
   - ipympl
   - nodejs
-  - pip:
-    - tensorflow
-    - tf-nightly
+   - tensorflow
 prefix: /Users/chuckmartin/.conda/envs/ccm_stock
