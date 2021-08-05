@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 import leading_pattern.model as model
-from utils import big_results_writer
+from leading_pattern.utils import big_results_writer
 import leading_pattern.plotting as plotting
 
 
